@@ -1,0 +1,11 @@
+[Unit]
+Description=Run the career-ops internship scan daily at 18:00
+
+[Timer]
+OnCalendar=*-*-* 18:00:00
+# Machine asleep at 18:00? Run once it comes back rather than skipping the day.
+Persistent=true
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

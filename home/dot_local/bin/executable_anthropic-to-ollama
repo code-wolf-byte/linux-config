@@ -1,0 +1,538 @@
+#!/usr/bin/env python3
+"""Proxy translating Anthropic Messages API → OpenAI Chat Completions API for Ollama."""
+
+import json
+import re
+import sys
+import uuid
+import traceback
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from socketserver import ThreadingMixIn
+from urllib.request import urlopen, Request
+from urllib.error import HTTPError, URLError
+
+OLLAMA_URL = "http://localhost:11434/api/chat"
+OLLAMA_MODEL = None
+
+THINK_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL)
+THINK_STRIP_RE = re.compile(r"<think>.*?</think>\s*", re.DOTALL)
+
+# qwen3 thinking mode hallucinates tool names; correct them to the actual zerostack tool names
+TOOL_NAME_CORRECTIONS = {
+    "read_file": "read",
+    "write_file": "write",
+    "edit_file": "edit",
+    "list_files": "list_dir",
+    "ls": "list_dir",
+    "find": "find_files",
+    "search": "grep",
+    "search_files": "grep",
+    "grep_search": "grep",
+    "run_command": "bash",
+    "execute": "bash",
+    "shell": "bash",
+}
+TOOL_CALL_RE = re.compile(
+    r"<function=(\w+)>\s*(.*?)\s*</function>",
+    re.DOTALL,
+)
+PARAM_RE = re.compile(
+    r"<parameter=(\w+)>\s*(.*?)\s*</parameter>",
+    re.DOTALL,
+)
+
+
+def log(msg):
+    sys.stderr.write(f"[proxy] {msg}\n")
+    sys.stderr.flush()
+
+
+def parse_xml_tool_calls(text):
+    """Parse XML-style tool calls from model text output.
+    Returns (clean_text, tool_calls_list)."""
+    clean = THINK_RE.sub("", text).strip()
+
+    calls = []
+    for m in TOOL_CALL_RE.finditer(clean):
+        name = m.group(1)
+        params_block = m.group(2)
+        params = {}
+        for pm in PARAM_RE.finditer(params_block):
+            key = pm.group(1)
+            val = pm.group(2).strip()
+            try:
+                val = json.loads(val)
+            except (json.JSONDecodeError, ValueError):
+                pass
+            params[key] = val
+        calls.append({
+            "id": "toolu_" + uuid.uuid4().hex[:24],
+            "name": name,
+            "input": params,
+        })
+
+    remaining = TOOL_CALL_RE.sub("", clean).strip()
+    remaining = re.sub(r"</tool_call>\s*", "", remaining).strip()
+    return remaining, calls
+
+
+def convert_request(body):
+    messages = []
+
+    system = body.get("system")
+    if system:
+        if isinstance(system, str):
+            messages.append({"role": "system", "content": system})
+        elif isinstance(system, list):
+            text = "\n\n".join(b.get("text", "") for b in system if b.get("type") == "text")
+            if text:
+                messages.append({"role": "system", "content": text})
+
+    for msg in body.get("messages", []):
+        role = msg["role"]
+        content = msg.get("content", "")
+
+        if isinstance(content, str):
+            messages.append({"role": role, "content": content})
+            continue
+
+        if isinstance(content, list):
+            text_parts = []
+            tool_results = []
+            tool_calls_out = []
+            for block in content:
+                if isinstance(block, str):
+                    text_parts.append(block)
+                elif block.get("type") == "text":
+                    text_parts.append(block.get("text", ""))
+                elif block.get("type") == "tool_use":
+                    tool_calls_out.append({
+                        "id": block["id"],
+                        "function": {
+                            "name": block["name"],
+                            "arguments": block.get("input", {}),
+                        },
+                    })
+                elif block.get("type") == "tool_result":
+                    result_content = block.get("content", "")
+                    if isinstance(result_content, list):
+                        result_content = "\n".join(
+                            b.get("text", "") for b in result_content if b.get("type") == "text"
+                        )
+                    tool_results.append({
+                        "role": "tool",
+                        "tool_call_id": block.get("tool_use_id", ""),
+                        "content": str(result_content),
+                    })
+
+            if tool_calls_out:
+                messages.append({
+                    "role": "assistant",
+                    "content": "\n".join(text_parts) if text_parts else None,
+                    "tool_calls": tool_calls_out,
+                })
+            elif text_parts:
+                messages.append({"role": role, "content": "\n".join(text_parts)})
+            messages.extend(tool_results)
+
+    model = body.get("model", "qwen3-coder")
+
+    # devstral ignores API tool definitions when the system prompt is long (10k+)
+    # because the embedded tool-description prose overrides the structured tools.
+    # Cap only for devstral; other models (qwen3-coder, etc.) need the full prompt
+    # to know which tool names are available.
+    DEVSTRAL_SYSTEM_CAP = 800
+    if (OLLAMA_MODEL or model).startswith("devstral"):
+        if body.get("tools") and messages and messages[0]["role"] == "system":
+            content = messages[0]["content"]
+            if isinstance(content, str) and len(content) > DEVSTRAL_SYSTEM_CAP:
+                messages[0] = dict(messages[0])
+                messages[0]["content"] = content[:DEVSTRAL_SYSTEM_CAP]
+
+    # qwen3 thinking control: /think on the first turn (plan carefully),
+    # /no_think on follow-up turns (act decisively, avoids infinite tool loops)
+    if (OLLAMA_MODEL or model).startswith("qwen3"):
+        has_tool_results = any(m.get("role") == "tool" for m in messages)
+        think_token = "/no_think" if has_tool_results else "/think"
+        for i in range(len(messages) - 1, -1, -1):
+            if messages[i].get("role") == "user" and isinstance(messages[i].get("content"), str):
+                messages[i] = dict(messages[i])
+                messages[i]["content"] += f"\n{think_token}"
+                log(f"  qwen3 think_token={think_token} has_tool_results={has_tool_results}")
+                break
+
+    openai_req = {
+        "model": model,
+        "messages": messages,
+        "stream": body.get("stream", False),
+    }
+
+    options = {"temperature": 0}  # deterministic output for reliable tool calling
+    if "max_tokens" in body:
+        options["num_predict"] = body["max_tokens"]
+    if "temperature" in body:
+        options["temperature"] = body["temperature"]
+    if "top_p" in body:
+        options["top_p"] = body["top_p"]
+    openai_req["options"] = options
+    if "stop_sequences" in body:
+        openai_req["stop"] = body["stop_sequences"]
+
+    tools = body.get("tools")
+    if tools:
+        openai_req["tools"] = []
+        for tool in tools:
+            openai_req["tools"].append({
+                "type": "function",
+                "function": {
+                    "name": tool["name"],
+                    "description": tool.get("description", ""),
+                    "parameters": tool.get("input_schema", {}),
+                },
+            })
+
+    return openai_req
+
+
+def _correct_tool_name(name):
+    corrected = TOOL_NAME_CORRECTIONS.get(name, name)
+    if corrected != name:
+        log(f"  TOOL name correction: {name!r} → {corrected!r}")
+    return corrected
+
+
+def _parse_tool_input(arguments):
+    """Normalize tool arguments — native Ollama returns a dict, OpenAI compat a JSON string."""
+    if isinstance(arguments, dict):
+        return arguments
+    try:
+        return json.loads(arguments)
+    except (json.JSONDecodeError, TypeError):
+        return {}
+
+
+def convert_response(ollama_resp, model):
+    msg = ollama_resp.get("message", {})
+    content = []
+
+    text = msg.get("content", "") or ""
+    api_tool_calls = msg.get("tool_calls") or []
+
+    if api_tool_calls:
+        thinking_blocks, remaining = _split_thinking(text)
+        for t in thinking_blocks:
+            content.append({"type": "thinking", "thinking": t})
+        if remaining:
+            content.append({"type": "text", "text": remaining})
+        for tc in api_tool_calls:
+            fn = tc.get("function", {})
+            content.append({
+                "type": "tool_use",
+                "id": tc.get("id", "toolu_" + uuid.uuid4().hex[:24]),
+                "name": _correct_tool_name(fn.get("name", "")),
+                "input": _parse_tool_input(fn.get("arguments", {})),
+            })
+        stop_reason = "tool_use"
+    elif "<function=" in text:
+        remaining, parsed_calls = parse_xml_tool_calls(text)
+        if parsed_calls:
+            if remaining:
+                content.append({"type": "text", "text": remaining})
+            for tc in parsed_calls:
+                content.append({"type": "tool_use", **tc})
+            stop_reason = "tool_use"
+        else:
+            content.append({"type": "text", "text": text})
+            stop_reason = "end_turn"
+    else:
+        thinking_blocks, remaining = _split_thinking(text)
+        for t in thinking_blocks:
+            content.append({"type": "thinking", "thinking": t})
+        content.append({"type": "text", "text": remaining or ""})
+        stop_reason = "end_turn"
+
+    if ollama_resp.get("done_reason") == "length":
+        stop_reason = "max_tokens"
+
+    return {
+        "id": "msg_" + uuid.uuid4().hex[:24],
+        "type": "message",
+        "role": "assistant",
+        "model": model,
+        "content": content if content else [{"type": "text", "text": ""}],
+        "stop_reason": stop_reason,
+        "stop_sequence": None,
+        "usage": {
+            "input_tokens": ollama_resp.get("prompt_eval_count", 0),
+            "output_tokens": ollama_resp.get("eval_count", 0),
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+        },
+    }
+
+
+def handle_streaming(wfile, openai_req, model):
+    msg_id = "msg_" + uuid.uuid4().hex[:24]
+    output_tokens = 0
+
+    _send_sse(wfile, "message_start", {
+        "type": "message_start",
+        "message": {
+            "id": msg_id, "type": "message", "role": "assistant", "model": model,
+            "content": [], "stop_reason": None, "stop_sequence": None,
+            "usage": {"input_tokens": 0, "output_tokens": 0,
+                       "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0},
+        },
+    })
+
+    log(f"  STREAM sending to {OLLAMA_URL}: tools={len(openai_req.get('tools',[]))} msgs={len(openai_req.get('messages',[]))}")
+    req = Request(
+        OLLAMA_URL,
+        data=json.dumps(openai_req).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+
+    try:
+        resp = urlopen(req, timeout=300)
+    except (HTTPError, URLError) as e:
+        error_body = e.read().decode() if hasattr(e, "read") else str(e)
+        log(f"Ollama error: {error_body}")
+        _emit_text_block(wfile, 0, f"Error from Ollama: {error_body}")
+        _emit_finish(wfile, "end_turn", 0)
+        return
+
+    text_buffer = ""
+    api_tool_calls = []  # native Ollama sends all tool_calls at once in one chunk
+
+    for raw_line in resp:
+        line = raw_line.decode("utf-8").strip()
+        log(f"  STREAM line: {line[:200]}")
+        if not line:
+            continue
+
+        try:
+            chunk = json.loads(line)
+        except json.JSONDecodeError:
+            log(f"  STREAM json_err on: {line[:100]}")
+            continue
+
+        if "eval_count" in chunk:
+            output_tokens = chunk.get("eval_count", output_tokens)
+
+        msg = chunk.get("message", {})
+        if msg.get("content"):
+            text_buffer += msg["content"]
+        if msg.get("tool_calls"):
+            log(f"  STREAM got tool_calls: {[tc.get('function',{}).get('name') for tc in msg['tool_calls']]}")
+            api_tool_calls.extend(msg["tool_calls"])
+
+        if chunk.get("done"):
+            log(f"  STREAM done: text_len={len(text_buffer)} tool_calls={len(api_tool_calls)}")
+            break
+
+    block_idx = 0
+
+    if api_tool_calls:
+        thinking_blocks, remaining = _split_thinking(text_buffer)
+        for t in thinking_blocks:
+            _emit_thinking_block(wfile, block_idx, t)
+            block_idx += 1
+        if remaining.strip():
+            _emit_text_block(wfile, block_idx, remaining)
+            block_idx += 1
+        for tc in api_tool_calls:
+            fn = tc.get("function", {})
+            tool_id = tc.get("id", "toolu_" + uuid.uuid4().hex[:24])
+            _emit_tool_use_block(wfile, block_idx, tool_id, _correct_tool_name(fn.get("name", "")),
+                                 _parse_tool_input(fn.get("arguments", {})))
+            block_idx += 1
+        _emit_finish(wfile, "tool_use", output_tokens)
+
+    elif "<function=" in text_buffer:
+        remaining, parsed_calls = parse_xml_tool_calls(text_buffer)
+        if parsed_calls:
+            log(f"  parsed {len(parsed_calls)} XML tool call(s) from text")
+            if remaining:
+                _emit_text_block(wfile, block_idx, remaining)
+                block_idx += 1
+            for tc in parsed_calls:
+                _emit_tool_use_block(wfile, block_idx, tc["id"], _correct_tool_name(tc["name"]), tc["input"])
+                block_idx += 1
+            _emit_finish(wfile, "tool_use", output_tokens)
+        else:
+            _emit_text_block(wfile, 0, text_buffer)
+            _emit_finish(wfile, "end_turn", output_tokens)
+
+    else:
+        thinking_blocks, remaining = _split_thinking(text_buffer)
+        for t in thinking_blocks:
+            _emit_thinking_block(wfile, block_idx, t)
+            block_idx += 1
+        _emit_text_block(wfile, block_idx, remaining)
+        _emit_finish(wfile, "end_turn", output_tokens)
+
+
+def _emit_text_block(wfile, index, text):
+    _send_sse(wfile, "content_block_start",
+              {"type": "content_block_start", "index": index,
+               "content_block": {"type": "text", "text": ""}})
+    _send_sse(wfile, "content_block_delta",
+              {"type": "content_block_delta", "index": index,
+               "delta": {"type": "text_delta", "text": text}})
+    _send_sse(wfile, "content_block_stop",
+              {"type": "content_block_stop", "index": index})
+
+
+def _emit_tool_use_block(wfile, index, tool_id, name, input_data):
+    _send_sse(wfile, "content_block_start",
+              {"type": "content_block_start", "index": index,
+               "content_block": {"type": "tool_use", "id": tool_id, "name": name, "input": {}}})
+    _send_sse(wfile, "content_block_delta",
+              {"type": "content_block_delta", "index": index,
+               "delta": {"type": "input_json_delta", "partial_json": json.dumps(input_data)}})
+    _send_sse(wfile, "content_block_stop",
+              {"type": "content_block_stop", "index": index})
+
+
+def _emit_thinking_block(wfile, index, thinking_text):
+    _send_sse(wfile, "content_block_start",
+              {"type": "content_block_start", "index": index,
+               "content_block": {"type": "thinking", "thinking": ""}})
+    _send_sse(wfile, "content_block_delta",
+              {"type": "content_block_delta", "index": index,
+               "delta": {"type": "thinking_delta", "thinking": thinking_text}})
+    _send_sse(wfile, "content_block_stop",
+              {"type": "content_block_stop", "index": index})
+
+
+def _emit_finish(wfile, stop_reason, output_tokens):
+    _send_sse(wfile, "message_delta",
+              {"type": "message_delta",
+               "delta": {"stop_reason": stop_reason, "stop_sequence": None},
+               "usage": {"output_tokens": output_tokens}})
+    _send_sse(wfile, "message_stop", {"type": "message_stop"})
+
+
+def _split_thinking(text):
+    """Split text into (thinking_blocks, remaining_text) from <think>...</think> tags."""
+    thinking_blocks = [m.group(1).strip() for m in THINK_RE.finditer(text)]
+    remaining = THINK_STRIP_RE.sub("", text).strip()
+    return thinking_blocks, remaining
+
+
+def _send_sse(wfile, event, data):
+    wfile.write(f"event: {event}\ndata: {json.dumps(data)}\n\n".encode())
+    wfile.flush()
+
+
+class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
+    daemon_threads = True
+
+
+class ProxyHandler(BaseHTTPRequestHandler):
+    def log_message(self, fmt, *args):
+        log(fmt % args)
+
+    def do_HEAD(self):
+        self.send_response(200)
+        self.end_headers()
+
+    def do_GET(self):
+        log(f"GET {self.path}")
+        if self.path in ("/health", "/v1/health", "/"):
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"status":"ok"}')
+        else:
+            self.send_error(404)
+
+    def do_POST(self):
+        log(f"POST {self.path}")
+        try:
+            if "/messages" in self.path:
+                self._handle_messages()
+            elif "/complete" in self.path:
+                self._handle_messages()
+            else:
+                log(f"Unhandled POST path: {self.path}")
+                self.send_error(404)
+        except BrokenPipeError:
+            log("Client disconnected (broken pipe)")
+        except Exception as e:
+            log(f"Error handling request: {traceback.format_exc()}")
+            try:
+                self.send_error(500, str(e))
+            except Exception:
+                pass
+
+    def _handle_messages(self):
+        length = int(self.headers.get("Content-Length", 0))
+        raw = self.rfile.read(length)
+        body = json.loads(raw)
+
+        response_model = body.get("model", "claude-sonnet-4-6")
+        if OLLAMA_MODEL:
+            body["model"] = OLLAMA_MODEL
+        ollama_model = body.get("model", "qwen3-coder")
+        stream = body.get("stream", False)
+
+        log(f"  ollama_model={ollama_model} response_model={response_model} stream={stream} msg_count={len(body.get('messages', []))} tools={len(body.get('tools', []))}")
+
+        openai_req = convert_request(body)
+        msgs = openai_req.get("messages", [])
+        sys_msg = next((m for m in msgs if m.get("role") == "system"), None)
+        sys_content = sys_msg.get("content", "") if sys_msg else ""
+        log(f"  DEBUG ollama_req_tools={len(openai_req.get('tools', []))} messages={len(msgs)} has_system={sys_msg is not None} system_len={len(sys_content)}")
+        log(f"  DEBUG system_snippet={sys_content[:300]}")
+        with open("/tmp/zerostack_ollama_req.json", "w") as _f:
+            json.dump(openai_req, _f, indent=2)
+
+        if stream:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+            handle_streaming(self.wfile, openai_req, response_model)
+        else:
+            req = Request(
+                OLLAMA_URL,
+                data=json.dumps(openai_req).encode(),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            try:
+                resp = urlopen(req, timeout=300)
+                ollama_resp = json.loads(resp.read())
+            except (HTTPError, URLError) as e:
+                error_body = e.read().decode() if hasattr(e, "read") else str(e)
+                log(f"Ollama error: {error_body}")
+                self.send_error(502, f"Ollama error: {error_body}")
+                return
+
+            anthropic_resp = convert_response(ollama_resp, response_model)
+            payload = json.dumps(anthropic_resp).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+
+def main():
+    global OLLAMA_MODEL
+    port = int(sys.argv[1]) if len(sys.argv) > 1 else 4001
+    OLLAMA_MODEL = sys.argv[2] if len(sys.argv) > 2 else None
+    server = ThreadedHTTPServer(("127.0.0.1", port), ProxyHandler)
+    model_info = f" (forcing model: {OLLAMA_MODEL})" if OLLAMA_MODEL else ""
+    log(f"Listening on http://127.0.0.1:{port}{model_info}")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    server.server_close()
+
+
+if __name__ == "__main__":
+    main()

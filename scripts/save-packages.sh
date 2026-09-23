@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
-# Snapshot explicitly installed packages into packages/.
+# Snapshot explicitly installed packages into hosts/<hostname>/packages/.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-pacman -Qqen > packages/pacman.txt
-pacman -Qqem > packages/aur.txt
-git --no-pager diff --stat -- packages/
+dir="hosts/$(cat /etc/hostname)/packages"
+mkdir -p "$dir"
+pacman -Qqen > "$dir/pacman.txt"
+pacman -Qqem > "$dir/aur.txt"
+git --no-pager diff --stat -- "$dir"

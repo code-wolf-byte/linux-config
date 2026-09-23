@@ -5,14 +5,17 @@ cd "$(dirname "$0")"
 repo=$PWD
 
 sudo pacman -S --needed chezmoi git
-sudo pacman -S --needed - < packages/pacman.txt
-if [[ -s packages/aur.txt ]]; then
+pkgs="hosts/$(cat /etc/hostname)/packages"
+[[ -d $pkgs ]] || { echo "no $pkgs; copy another host's list there first"; exit 1; }
+sudo pacman -S --needed - < "$pkgs/pacman.txt"
+if [[ -s "$pkgs/aur.txt" ]]; then
   command -v yay >/dev/null || { echo "install yay first for AUR packages"; exit 1; }
-  yay -S --needed - < packages/aur.txt
+  yay -S --needed - < "$pkgs/aur.txt"
 fi
 
 ./scripts/apply-system.sh
 
+git config core.hooksPath .githooks   # secret-scan pre-commit hook
 chezmoi init --source "$repo"
 chezmoi apply -v
 

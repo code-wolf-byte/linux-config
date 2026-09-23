@@ -1,0 +1,7 @@
+debtap
+google-chrome
+keybase-bin
+libsoup
+openscreen
+qdirstat
+zoom

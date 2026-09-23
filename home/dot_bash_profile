@@ -1,0 +1,14 @@
+#
+# ~/.bash_profile
+#
+
+[[ -f ~/.bashrc ]] && . ~/.bashrc
+. "$HOME/.cargo/env"
+
+# Added by LM Studio CLI (lms)
+export PATH="$PATH:/home/tupreti/.lmstudio/bin"
+# End of LM Studio CLI section
+
+
+# Added by NV Broadcast installer — show app in desktop menu
+export XDG_DATA_DIRS="$HOME/.local/share:${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"

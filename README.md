@@ -9,7 +9,7 @@ in one repo, loosely modelled on
 | `home/` | `~` | [chezmoi](https://chezmoi.io) (`.chezmoiroot` points here) |
 | `system/` | `/` | `scripts/apply-system.sh` (sudo) |
 | `hosts/<hostname>/system/` | `/`, only on that host | `scripts/apply-system.sh` |
-| `packages/pacman.txt`, `packages/aur.txt` | installed packages | `bootstrap.sh` |
+| `hosts/<hostname>/packages/{pacman,aur}.txt` | installed packages | `bootstrap.sh` |
 
 ## New machine
 
@@ -27,8 +27,11 @@ chezmoi diff && chezmoi apply                # repo -> ~
 chezmoi add ~/.config/foo                    # start tracking a new dotfile
 
 ./scripts/apply-system.sh                    # system/ -> /
-./scripts/save-packages.sh                   # refresh package lists
+./scripts/save-packages.sh                   # refresh this host's package lists
 ```
+
+Commits run `.githooks/pre-commit`, which blocks likely secrets (tokens, keys, long opaque IDs,
+`.env`/key files). Keep secrets in untracked files under `~/.config/` and read them at runtime.
 
 chezmoi naming: `dot_config` → `.config`, `executable_` sets +x, `*.tmpl` files are
 templates (use `{{ .chezmoi.hostname }}` for per-machine differences).

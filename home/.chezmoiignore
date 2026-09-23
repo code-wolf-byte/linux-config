@@ -1,0 +1,8 @@
+# Services/scripts that only make sense on the desktop "rig" (DDNS, daily job).
+{{ if ne .chezmoi.hostname "rig" }}
+cf-ddns.sh
+.local/bin/career-ops-*
+.config/systemd/user/cf-ddns.service
+.config/systemd/user/career-ops-daily.*
+.config/systemd/user/*.target.wants
+{{ end }}

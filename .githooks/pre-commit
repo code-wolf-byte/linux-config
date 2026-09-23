@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# Block commits that add likely secrets. Enabled by bootstrap.sh (core.hooksPath).
+# False positive? Move the value out of the repo, or `git commit --no-verify` if you're sure.
+set -uo pipefail
+
+bad_names='(^|/)(\.env|[^/]*\.env|id_(rsa|ed25519|ecdsa)|sa\.json|[^/]*\.(pem|key|p12|pfx)|\.npmrc|\.netrc|credentials[^/]*)$'
+names=$(git diff --cached --name-only --diff-filter=ACR | grep -E "$bad_names")
+
+patterns=(
+  '-----BEGIN [A-Z ]*PRIVATE KEY-----'
+  '(ghp|gho|ghs|ghu|github_pat|glpat|xox[abprs])[-_][A-Za-z0-9_]{10,}'
+  '(sk-ant-|sk-)[A-Za-z0-9_-]{20,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{35}'
+  '(key|token|secret|passw(or)?d|_id)["'\'']?[[:space:]]*[:=][[:space:]]*["'\''][A-Za-z0-9+_.=-][A-Za-z0-9/+_.=-]{15,}["'\'']'
+  '["'\''][A-Za-z0-9_-]{32,}["'\'']'
+)
+added=$(git diff --cached -U0 --diff-filter=ACMR --no-color \
+  | awk '/^\+\+\+ /{f=substr($0,7); next} /^\+/{print f": "substr($0,2)}')
+hits=$(grep -iE -e "$(IFS='|'; echo "${patterns[*]}")" <<<"$added")
+(( $? > 1 )) && { echo "pre-commit: secret scan failed, commit blocked." >&2; exit 1; }
+
+[[ -z $names && -z $hits ]] && exit 0
+echo "pre-commit: possible secrets staged, commit blocked." >&2
+[[ -n $names ]] && printf '  file: %s\n' $names >&2
+[[ -n $hits ]] && printf '%s\n' "$hits" | cut -c1-160 | sed 's/^/  /' >&2
+exit 1

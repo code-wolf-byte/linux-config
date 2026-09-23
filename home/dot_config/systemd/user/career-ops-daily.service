@@ -1,0 +1,10 @@
+[Unit]
+Description=career-ops daily Simplify internship scan
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/home/tupreti/.local/bin/career-ops-daily.sh
+# 8h of retries + the run itself; kill it before the next day's fire.
+TimeoutStartSec=10h
