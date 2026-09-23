@@ -1,0 +1,6 @@
+{{ if eq .chezmoi.hostname "rig" }}Some([
+    "com.system76.CosmicAppletAudio",
+    "com.system76.CosmicAppletTime",
+]){{ else }}Some([
+    "com.system76.CosmicAppletTime",
+]){{ end }}
