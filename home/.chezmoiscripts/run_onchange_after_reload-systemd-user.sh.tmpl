@@ -1,0 +1,4 @@
+#!/bin/sh
+# Re-run whenever a user unit changes:
+# units: {{ range (glob (joinPath .chezmoi.sourceDir "dot_config/systemd/user/*")) }}{{ include . | sha256sum }} {{ end }}
+systemctl --user daemon-reload

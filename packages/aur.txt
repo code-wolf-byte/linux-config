@@ -1,0 +1,10 @@
+caffeine-ng
+debtap
+google-chrome
+iio-hyprland-git
+linux-ogc
+linux-ogc-headers
+notion-app-electron
+slack-desktop
+z13ctl-bin
+zoom
