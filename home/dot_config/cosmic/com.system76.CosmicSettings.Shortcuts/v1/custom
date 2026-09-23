@@ -1,0 +1,27 @@
+{
+    (
+        modifiers: [],
+        key: "Print",
+    ): Disable,
+    (
+        modifiers: [],
+        key: "XF86PowerOff",
+    ): System(LogOut),
+    (
+        modifiers: [
+            Super,
+        ],
+        key: "p",
+    ): System(DisplayToggle),
+    (
+        modifiers: [],
+        key: "XF86Launch3",
+    ): System(PowerOff),
+    (
+        modifiers: [
+            Super,
+            Shift,
+        ],
+        key: "s",
+    ): System(Screenshot),
+}
